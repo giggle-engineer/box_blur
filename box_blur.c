@@ -16,7 +16,7 @@ static int image_height = 0;
 static int stride = 0;
 
 /* ffmpeg -i input.png -f rawvideo -pix_fmt rgb32 output.raw */
-static uint8_t* read_raw( const char *name, long *length )
+static uint8_t* read_raw( const char *name )
 {
 	FILE *file = fopen( name, "r" );
 	uint8_t *raw = malloc( stride*(image_height+2)*4 );
@@ -40,7 +40,7 @@ static uint8_t* read_raw( const char *name, long *length )
 }
 
 /* ffmpeg -s 403x403 -f rawvideo -pix_fmt rgb32 -i hachidorii_blurred.raw hachidorii_blurred.png */
-static void write_raw( const char *name, uint8_t *raw, long *length )
+static void write_raw( const char *name, uint8_t *raw )
 {
 	FILE *file = fopen( name, "wb" );
 	for( int y = 0; y < image_height; y++ )
@@ -67,16 +67,64 @@ static void average_neighbors( uint8_t *raw, uint8_t *blurred, int x, int y )
 	}	
 }
 
+static void average_neighbors_simd( uint8_t *raw, uint8_t *blurred, int x, int y )
+{
+	static const uint16_t divide[8] __attribute__((aligned(16))) = {
+		7282,
+		7282,
+		7282,
+		7282,
+		7282,
+		7282,
+		7282,
+		7282
+	};
+
+	__asm__(
+		"pmovzxbw       %1, %%xmm0 \n"
+		"pmovzxbw       %2, %%xmm1 \n"
+		"pmovzxbw       %3, %%xmm2 \n"
+		"pmovzxbw       %4, %%xmm3 \n"
+		"pmovzxbw       %5, %%xmm4 \n"
+		"pmovzxbw       %6, %%xmm5 \n"
+		"pmovzxbw       %7, %%xmm6 \n"
+		"pmovzxbw       %8, %%xmm7 \n"
+		"pmovzxbw       %9, %%xmm8 \n"
+		"movdqa         %10,%%xmm9 \n"
+		"paddw          %%xmm1, %%xmm0 \n"
+		"paddw          %%xmm2, %%xmm0 \n"
+		"paddw          %%xmm3, %%xmm0 \n"
+		"paddw          %%xmm4, %%xmm0 \n"
+		"paddw          %%xmm5, %%xmm0 \n"
+		"paddw          %%xmm6, %%xmm0 \n"
+		"paddw          %%xmm7, %%xmm0 \n"
+		"paddw          %%xmm8, %%xmm0 \n"
+		"pmulhuw        %%xmm9, %%xmm0 \n"
+		"packuswb       %%xmm0, %%xmm0 \n"
+		"movq           %%xmm0, %0    \n"
+		:"=m"(blurred[(x + y*stride)*4])
+		:"m"(raw[(x + y*stride)*4]),
+		"m"(raw[(x+1 + y*stride)*4]),
+		"m"(raw[(x+1 + (y+1)*stride)*4]),
+		"m"(raw[(x + (y+1)*stride)*4]),
+		"m"(raw[(x-1 + (y+1)*stride)*4]),
+		"m"(raw[(x-1 + y*stride)*4]),
+		"m"(raw[(x-1 + (y-1)*stride)*4]),
+		"m"(raw[(x + (y-1)*stride)*4]),
+		"m"(raw[(x+1 + (y-1)*stride)*4]),
+		"m"(*divide)
+    );
+}
+
 int main( int agrc, char** argv )
 {
 	uint8_t *raw;
-	long length;
 	char *filename = argv[1];
 	image_width = atoi( argv[2] );
 	image_height = atoi( argv[3] );
 	printf("%s %d %d\n", filename, image_width, image_height);
 	stride = image_width+2;
-	raw = read_raw( filename, &length );
+	raw = read_raw( filename );
 	uint8_t *blurred = malloc( stride*(image_height+2)*4 );
 
 	clock_t start = clock();
@@ -105,9 +153,37 @@ int main( int agrc, char** argv )
 	clock_t end = clock();
 	float seconds = (float)(end - start) / CLOCKS_PER_SEC;
 	printf("Regular box blur took %f seconds\n", seconds);
+	write_raw( "me_blurred.raw", blurred );
 
-	write_raw( "me_blurred.raw", blurred, &length );
-	
+	start = clock();
+	memset( blurred, 0, stride*(image_height+2)*4 );
+	/* Box Blur applied 3 times is extremely similar to Gaussian blur */
+	for ( int y = 0; y < image_height+2; y++ )
+	{
+		for ( int x = 0; x < stride; x+=2 )
+		{
+			average_neighbors_simd( raw, blurred, x, y );
+		}
+	}
+	for ( int y = 0; y < image_height+2; y++ )
+	{
+		for ( int x = 0; x < stride; x+=2 )
+		{
+			average_neighbors_simd( blurred, blurred, x, y );
+		}
+	}
+	for ( int y = 0; y < image_height+2; y++ )
+	{
+		for ( int x = 0; x < stride; x+=2 )
+		{
+			average_neighbors_simd( blurred, blurred, x, y );
+		}
+	}
+	end = clock();
+	seconds = (float)(end - start) / CLOCKS_PER_SEC;
+	printf("SIMD blur took %f seconds\n", seconds);
+	write_raw( "blurred_simd.raw", blurred );
+
 	free( raw );
 	free( blurred );
 	return 0;
