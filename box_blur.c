@@ -50,6 +50,87 @@ static void write_raw( const char *name, uint8_t *raw )
 	fclose( file );
 }
 
+static void grayscale( uint8_t *raw, uint8_t *grayed, int x, int y )
+{
+	uint8_t B = raw[(x + y*stride)*4];
+	uint8_t G = raw[(x + y*stride)*4+1];
+	uint8_t R = raw[(x + y*stride)*4+2];
+	uint8_t average = ((9*B)+(92*G)+(27*R))/128;
+	
+	grayed[(x + y*stride)*4] = average;
+	grayed[(x + y*stride)*4+1] = average;
+	grayed[(x + y*stride)*4+2] = average;
+	grayed[(x + y*stride)*4+3] = raw[(x + y*stride)*4+3];
+}
+
+static void grayscale_simd( uint8_t *raw, uint8_t *grayed, int x, int y )
+{
+	static const uint8_t weights[16] __attribute__((aligned(16))) = {
+		9,
+		92,
+		27,
+		0,
+		9,
+		92,
+		27,
+		0,
+		9,
+		92,
+		27,
+		0,
+		9,
+		92,
+		27,
+		0
+	};
+
+	static const uint8_t alpha[16] __attribute__((aligned(16))) = {
+		0,
+		0,
+		0,
+		0xFF,
+		0,
+		0,
+		0,
+		0xFF,
+		0,
+		0,
+		0,
+		0xFF,
+		0,
+		0,
+		0,
+		0xFF
+	};
+
+	__asm__(
+		"movdqu     %2,     %%xmm0 \n" /* 16 bytes (16x8bits, 128-bit), 4 pixels */
+		"movdqu     %3,     %%xmm1 \n" /* 16 bytes (16x8bits, 128-bit), 4 pixels */
+		"pmaddubsw  %4,     %%xmm0 \n" /* weigh (16x8bits) into (8x16bits, 128-bit) 32 bytes */
+		"pmaddubsw  %4,     %%xmm1 \n" /* weigh (16x8bits) into (8x16bits, 128-bit) 32 bytes */
+		"phaddw     %%xmm1, %%xmm0 \n" /* add two (8x16bits) into 8 averages (8x16bits) */
+		"psraw      $7,     %%xmm0 \n" /* shift all (8x16bits) right by 7 bits ie. /128 */
+		"packuswb   %%xmm0, %%xmm0 \n" /* pack down into (8x8bits) by saturaion */
+		"punpcklbw  %%xmm0, %%xmm0 \n" /* interleave xmm0 */
+		"movdqa     %%xmm0, %%xmm1 \n" /* save result into xmm1 */
+		"punpcklbw  %%xmm0, %%xmm0 \n" /* repeat left side into xmm0 */
+		"punpckhbw  %%xmm1, %%xmm1 \n" /* repeat right side into xmm1 */
+		"por        %5,     %%xmm0 \n" /* add alpha into every fourth byte into xmm0 */
+		"por        %5,     %%xmm1 \n" /* add alpha into every foruth byte into xmm1 */
+		"movdqu     %%xmm0, %0     \n" /* move xmm0 into grayed[(x + y*stride)*4] */
+		"movdqu     %%xmm1, %1     \n" /* move xmm1 into grayed[(x + y*stride)*4+16] */
+		:"=m"(grayed[(x + y*stride)*4]),
+		"=m"(grayed[(x + y*stride)*4+16])
+		:"m"(raw[(x + y*stride)*4]),
+		"m"(raw[(x + y*stride)*4+16]),
+		"m"(*weights),
+		"m"(*alpha)
+    );
+
+    //printf("raw:    %d %d %d\n", raw[(x + y*stride)*4], raw[(x + y*stride)*4+1], raw[(x + y*stride)*4+2]);
+    //printf("grayed: %d %d %d\n", grayed[(x + y*stride)*4], grayed[(x + y*stride)*4+1], grayed[(x + y*stride)*4+2]);
+}
+
 static void average_neighbors( uint8_t *raw, uint8_t *blurred, int x, int y )
 {
 	for ( int z = 0; z < 4; z++ )
@@ -122,7 +203,7 @@ int main( int agrc, char** argv )
 	char *filename = argv[1];
 	image_width = atoi( argv[2] );
 	image_height = atoi( argv[3] );
-	printf("%s %d %d\n", filename, image_width, image_height);
+	printf( "%s %d %d\n", filename, image_width, image_height );
 	stride = image_width+2;
 	raw = read_raw( filename );
 	uint8_t *blurred = malloc( stride*(image_height+2)*4 );
@@ -152,7 +233,7 @@ int main( int agrc, char** argv )
 	}
 	clock_t end = clock();
 	float seconds = (float)(end - start) / CLOCKS_PER_SEC;
-	printf("Regular box blur took %f seconds\n", seconds);
+	printf( "Regular box blur took %f seconds\n", seconds );
 	write_raw( "me_blurred.raw", blurred );
 
 	start = clock();
@@ -181,8 +262,36 @@ int main( int agrc, char** argv )
 	}
 	end = clock();
 	seconds = (float)(end - start) / CLOCKS_PER_SEC;
-	printf("SIMD blur took %f seconds\n", seconds);
+	printf( "SIMD blur took %f seconds\n", seconds );
 	write_raw( "blurred_simd.raw", blurred );
+
+	start = clock();
+	memset( blurred, 0, stride*(image_height+2)*4 );
+	for ( int y = 0; y < image_height+2; y++ )
+	{
+		for ( int x = 0; x < stride; x++ )
+		{
+			grayscale( raw, blurred, x, y );
+		}
+	}
+	end = clock();
+	seconds = (float)(end - start) / CLOCKS_PER_SEC;
+	printf( "grayscale took %f seconds\n", seconds );
+	write_raw( "grayscale.raw", blurred );
+
+	start = clock();
+	memset( blurred, 0, stride*(image_height+2)*4 );
+	for ( int y = 0; y < image_height+2; y++ )
+	{
+		for ( int x = 0; x < stride; x+=8 )
+		{
+			grayscale_simd( raw, blurred, x, y );
+		}
+	}
+	end = clock();
+	seconds = (float)(end - start) / CLOCKS_PER_SEC;
+	printf( "grayscale SIMD took %f seconds\n", seconds );
+	write_raw( "grayscale_simd.raw", blurred );
 
 	free( raw );
 	free( blurred );
