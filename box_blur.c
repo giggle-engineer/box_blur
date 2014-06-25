@@ -50,6 +50,13 @@ static void write_raw( const char *name, uint8_t *raw )
 	fclose( file );
 }
 
+static void write_padded( const char *name, uint8_t *raw )
+{
+	FILE *file = fopen( name, "wb" );
+	fwrite( raw, 1, stride*(image_height+2)*4, file );
+	fclose( file );
+}
+
 static void grayscale( uint8_t *raw, uint8_t *grayed, int x, int y )
 {
 	uint8_t B = raw[(x + y*stride)*4];
@@ -65,43 +72,9 @@ static void grayscale( uint8_t *raw, uint8_t *grayed, int x, int y )
 
 static void grayscale_simd( uint8_t *raw, uint8_t *grayed, int x, int y )
 {
-	static const uint8_t weights[16] __attribute__((aligned(16))) = {
-		9,
-		92,
-		27,
-		0,
-		9,
-		92,
-		27,
-		0,
-		9,
-		92,
-		27,
-		0,
-		9,
-		92,
-		27,
-		0
-	};
+	static const uint8_t weights[16] __attribute__((aligned(16))) = {9,92,27,0,9,92,27,0,9,92,27,0,9,92,27,0};
 
-	static const uint8_t alpha[16] __attribute__((aligned(16))) = {
-		0,
-		0,
-		0,
-		0xFF,
-		0,
-		0,
-		0,
-		0xFF,
-		0,
-		0,
-		0,
-		0xFF,
-		0,
-		0,
-		0,
-		0xFF
-	};
+	static const uint8_t alpha[16] __attribute__((aligned(16))) = {0,0,0,0xFF,0,0,0,0xFF,0,0,0,0xFF,0,0,0,0xFF};
 
 	__asm__(
 		"movdqu     %2,     %%xmm0 \n" /* 16 bytes (16x8bits, 128-bit), 4 pixels */
@@ -131,6 +104,33 @@ static void grayscale_simd( uint8_t *raw, uint8_t *grayed, int x, int y )
     //printf("grayed: %d %d %d\n", grayed[(x + y*stride)*4], grayed[(x + y*stride)*4+1], grayed[(x + y*stride)*4+2]);
 }
 
+static uint8_t clamp( int n, uint8_t min, uint8_t max )
+{
+	if ( n < min )
+	{
+		return min;
+	}
+	if ( n > max )
+	{
+		return max;
+	}
+	return (uint8_t)n;
+}
+
+static void sharpen( uint8_t *raw, uint8_t *blurred, int x, int y )
+{
+	for ( int z = 0; z < 3; z++ )
+	{
+		blurred[(x + y*stride)*4+z]=
+		clamp(((raw[(x + y*stride)*4+z]*5)
+		+(raw[(x+1 + y*stride)*4+z]*-1) /* E */
+		+(raw[(x + (y+1)*stride)*4+z]*-1) /* S */
+		+(raw[(x-1 + y*stride)*4+z]*-1) /* W */
+		+(raw[(x + (y-1)*stride)*4+z]*-1)), 0, 255); /* N */
+	}
+	blurred[(x + y*stride)*4+3] = 0xFF;
+}
+
 static void average_neighbors( uint8_t *raw, uint8_t *blurred, int x, int y )
 {
 	for ( int z = 0; z < 4; z++ )
@@ -150,20 +150,11 @@ static void average_neighbors( uint8_t *raw, uint8_t *blurred, int x, int y )
 
 static void average_neighbors_simd( uint8_t *raw, uint8_t *blurred, int x, int y )
 {
-	static const uint16_t divide[8] __attribute__((aligned(16))) = {
-		7282,
-		7282,
-		7282,
-		7282,
-		7282,
-		7282,
-		7282,
-		7282
-	};
+	static const uint16_t divide[8] __attribute__((aligned(16))) = {7282,7282,7282,7282,7282,7282,7282,7282};
 
 	__asm__(
-		"pmovzxbw   %1,     %%xmm0 \n"
-		"pmovzxbw   %2,     %%xmm1 \n"
+		"pmovzxbw   %1,     %%xmm0 \n" /* Pack an 8-bit vector into a 16-bit vector */
+		"pmovzxbw   %2,     %%xmm1 \n" /* This allows us to perform operations greater than 0xFF or 255 */
 		"pmovzxbw   %3,     %%xmm2 \n"
 		"pmovzxbw   %4,     %%xmm3 \n"
 		"pmovzxbw   %5,     %%xmm4 \n"
@@ -171,28 +162,28 @@ static void average_neighbors_simd( uint8_t *raw, uint8_t *blurred, int x, int y
 		"pmovzxbw   %7,     %%xmm6 \n"
 		"pmovzxbw   %8,     %%xmm7 \n"
 		"pmovzxbw   %9,     %%xmm8 \n"
-		"movdqa     %10,    %%xmm9 \n"
-		"paddw      %%xmm0, %%xmm1 \n"
-		"paddw      %%xmm2, %%xmm3 \n"
-		"paddw      %%xmm4, %%xmm5 \n"
+		"movdqa     %10,    %%xmm9 \n" /* Move an aligned double quadword into xmm9 */
+		"paddw      %%xmm0, %%xmm1 \n" /* Vertically add xmm0 and xmm1 */
+		"paddw      %%xmm2, %%xmm3 \n" /* Here we add up all the values of 2 pixels for BGRA */
+		"paddw      %%xmm4, %%xmm5 \n" /* Parallel add xmm0-8 so we don't have any dependencies */
 		"paddw      %%xmm6, %%xmm7 \n"
 		"paddw      %%xmm8, %%xmm1 \n"
 		"paddw      %%xmm1, %%xmm3 \n"
 		"paddw      %%xmm5, %%xmm7 \n"
-		"paddw      %%xmm3, %%xmm7 \n"
-		"pmulhuw    %%xmm9, %%xmm7 \n"
-		"packuswb   %%xmm7, %%xmm7 \n"
-		"movq       %%xmm7, %0     \n"
+		"paddw      %%xmm3, %%xmm7 \n" /* xmm7 now contains all the sums */
+		"pmulhuw    %%xmm9, %%xmm7 \n" /* Divide by 9 by use a multiply and having it wrap around (faster!) */
+		"packuswb   %%xmm7, %%xmm7 \n" /* Pack 16-bit vector into 8-bit vector */
+		"movq       %%xmm7, %0     \n" /* Move average into blurred */
 		:"=m"(blurred[(x + y*stride)*4])
 		:"m"(raw[(x + y*stride)*4]),
-		"m"(raw[(x+1 + y*stride)*4]),
-		"m"(raw[(x+1 + (y+1)*stride)*4]),
-		"m"(raw[(x + (y+1)*stride)*4]),
-		"m"(raw[(x-1 + (y+1)*stride)*4]),
-		"m"(raw[(x-1 + y*stride)*4]),
-		"m"(raw[(x-1 + (y-1)*stride)*4]),
-		"m"(raw[(x + (y-1)*stride)*4]),
-		"m"(raw[(x+1 + (y-1)*stride)*4]),
+		"m"(raw[(x+1 + y*stride)*4]), /* E */
+		"m"(raw[(x+1 + (y+1)*stride)*4]), /* SE */
+		"m"(raw[(x + (y+1)*stride)*4]), /* S */
+		"m"(raw[(x-1 + (y+1)*stride)*4]), /* SW */
+		"m"(raw[(x-1 + y*stride)*4]), /* W */
+		"m"(raw[(x-1 + (y-1)*stride)*4]), /* NW */
+		"m"(raw[(x + (y-1)*stride)*4]), /* N */
+		"m"(raw[(x+1 + (y-1)*stride)*4]), /* NE */
 		"m"(*divide)
     );
 }
@@ -206,6 +197,7 @@ int main( int agrc, char** argv )
 	printf( "%s %d %d\n", filename, image_width, image_height );
 	stride = image_width+2;
 	raw = read_raw( filename );
+	write_padded( "padded.raw", raw );
 	uint8_t *blurred = malloc( stride*(image_height+2)*4 );
 
 	clock_t start = clock();
@@ -234,7 +226,7 @@ int main( int agrc, char** argv )
 	clock_t end = clock();
 	float seconds = (float)(end - start) / CLOCKS_PER_SEC;
 	printf( "Regular box blur took %f seconds\n", seconds );
-	write_raw( "me_blurred.raw", blurred );
+	write_raw( "blurred.raw", blurred );
 
 	start = clock();
 	memset( blurred, 0, stride*(image_height+2)*4 );
