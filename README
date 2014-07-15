@@ -1,0 +1,8 @@
+I made this as an exercise to get more familiar with C and as an opportunity to learn to work with SIMD instructions. It implements three image processing filters. Grayscale, sharpen and box blur.
+
+It'll output 6 files using the filters. Once using C code and the other time using SIMD optimized instructions for each filter.
+
+Use like so.
+ffmpeg -i input.png -f rawvideo -pix_fmt rgb32 output.raw
+./box_blur filename width height
+ffmpeg -s 403x403 -f rawvideo -pix_fmt rgb32 -i simd_blurred.raw simd_blurred.png
